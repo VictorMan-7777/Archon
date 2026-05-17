@@ -1,0 +1,715 @@
+name: archon-milestone-governance-normalizer
+description: |
+  Use when: User wants to normalize a milestone into canonical governed structure.
+  Triggers: "normalize milestone", "governance normalizer", "milestone governance normalizer",
+            "normalize privileged execution", "governance normalize milestone",
+            "normalize milestone structure", "milestone normalization".
+  Does: Fetches milestone data from Gitea -> analyzes governance structure gaps ->
+        detects related issues -> generates normalized description preview ->
+        writes dry-run artifact -> waits for human approval (HIL gate) ->
+        prepares validated patch payload (prompt, read-only) ->
+        applies single deterministic PATCH (bash) -> verifies section markers in live milestone.
+  NOT for: Creating new milestones, auto-applying without approval, bulk normalization,
+           general issue management.
+
+  Critical safety rules:
+  - NEVER applies changes without explicit human APPROVE input
+  - NEVER fabricates issue references
+  - NEVER creates issues automatically
+  - Fails closed if milestone data cannot be fetched
+  - Dry-run preview is always generated and presented before any mutation
+
+provider: claude
+interactive: true
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 1A: FETCH MILESTONE
+  # Locate and fetch the target milestone — fail closed if not found
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: fetch-milestone
+    bash: |
+      REPO="FaithJourney/system-governance"
+      BASE_URL="http://192.168.1.50:3000/api/v1"
+      SEARCH_TERM="$ARGUMENTS"
+
+      if [ -z "$GITEA_TOKEN" ]; then
+        echo "ERROR: GITEA_TOKEN is not set — cannot authenticate with Gitea" >&2
+        exit 1
+      fi
+
+      # Fetch all milestones
+      MILESTONES=$(curl -sf "$BASE_URL/repos/$REPO/milestones?limit=50" \
+        -H "Authorization: token $GITEA_TOKEN") || {
+        echo "ERROR: Failed to fetch milestones from Gitea API" >&2
+        exit 1
+      }
+
+      # If a number was given, find by ID; otherwise search by title substring
+      MILESTONE=$(echo "$MILESTONES" | python3 -c "
+import json, sys, re
+milestones = json.load(sys.stdin)
+term = '$SEARCH_TERM'.strip()
+# Try numeric ID match first
+if re.match(r'^\d+$', term):
+    target_id = int(term)
+    for m in milestones:
+        if m['id'] == target_id:
+            print(json.dumps(m, indent=2))
+            sys.exit(0)
+# Fall back to case-insensitive title substring match
+term_lower = term.lower()
+for m in milestones:
+    if term_lower in m['title'].lower() or m['title'].lower() in term_lower:
+        print(json.dumps(m, indent=2))
+        sys.exit(0)
+print('NOT_FOUND')
+")
+
+      if [ "$MILESTONE" = "NOT_FOUND" ]; then
+        echo "ERROR: No milestone found matching: $SEARCH_TERM" >&2
+        echo "Available milestones:" >&2
+        echo "$MILESTONES" | python3 -c "
+import json, sys
+for m in json.load(sys.stdin):
+    print(f'  [{m[\"id\"]}] {m[\"title\"]}')
+" >&2
+        exit 1
+      fi
+
+      echo "=== TARGET MILESTONE ==="
+      echo "$MILESTONE"
+
+      # Persist milestone ID for downstream nodes
+      MILESTONE_ID=$(echo "$MILESTONE" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+      echo "$MILESTONE_ID" > "$ARTIFACTS_DIR/.milestone-id"
+
+      # Fetch issues attached to this milestone
+      echo ""
+      echo "=== ATTACHED ISSUES ==="
+      ISSUES=$(curl -sf "$BASE_URL/repos/$REPO/issues?milestone=$MILESTONE_ID&type=issues&state=open&limit=50" \
+        -H "Authorization: token $GITEA_TOKEN") || {
+        echo "WARNING: Could not fetch milestone issues"
+        ISSUES="[]"
+      }
+      echo "$ISSUES" | python3 -m json.tool
+
+      ISSUE_COUNT=$(echo "$ISSUES" | python3 -c "import json,sys; print(len(json.load(sys.stdin)))")
+      echo ""
+      echo "=== SUMMARY ==="
+      echo "Milestone ID: $MILESTONE_ID"
+      echo "Attached open issues: $ISSUE_COUNT"
+    timeout: 30000
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 1B: FETCH ORG CONTEXT (parallel with milestone fetch)
+  # All milestones, all issues, canonical labels — read-only context
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: fetch-org-context
+    bash: |
+      REPO="FaithJourney/system-governance"
+      BASE_URL="http://192.168.1.50:3000/api/v1"
+
+      echo "=== ALL MILESTONES (cross-reference map) ==="
+      curl -sf "$BASE_URL/repos/$REPO/milestones?limit=50" \
+        -H "Authorization: token $GITEA_TOKEN" | python3 -c "
+import json, sys
+for m in json.load(sys.stdin):
+    print(f'  [{m[\"id\"]}] {m[\"title\"]}')
+    print(f'      open_issues={m[\"open_issues\"]} | created={m[\"created_at\"][:10]}')
+    if m['description']:
+        for line in m['description'].split('\n')[:3]:
+            print(f'      {line}')
+    print()
+" || echo "Could not fetch milestones"
+
+      echo "=== ALL OPEN ISSUES (cross-milestone governance scan) ==="
+      curl -sf "$BASE_URL/repos/$REPO/issues?type=issues&state=open&limit=50" \
+        -H "Authorization: token $GITEA_TOKEN" | python3 -c "
+import json, sys
+issues = json.load(sys.stdin)
+for i in issues:
+    labels = [l['name'] for l in i.get('labels', [])]
+    ms = i.get('milestone') or {}
+    ms_title = ms.get('title', 'No milestone')
+    print(f'  #{i[\"number\"]}: {i[\"title\"]}')
+    print(f'    labels: {labels}  milestone: {ms_title}')
+" || echo "Could not fetch issues"
+
+      echo ""
+      echo "=== CANONICAL LABELS ==="
+      curl -sf "$BASE_URL/repos/$REPO/labels?limit=100" \
+        -H "Authorization: token $GITEA_TOKEN" | python3 -c "
+import json, sys
+labels = sorted(json.load(sys.stdin), key=lambda x: x['name'])
+for l in labels:
+    print(f'  {l[\"name\"]:30s} — {l[\"description\"]}')
+" || echo "Could not fetch labels"
+    timeout: 30000
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 2: ANALYZE
+  # Structural gap analysis — read-only, cannot write
+  # Produces a precise diagnosis before any normalization is attempted
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: analyze
+    prompt: |
+      You are a governance structure analyst. Analyze the milestone data below and
+      produce a structured gap analysis for governance normalization.
+
+      ## Milestone Data
+
+      $fetch-milestone.output
+
+      ## Org Context
+
+      $fetch-org-context.output
+
+      ## Governance Template Requirements
+
+      The canonical governed milestone structure requires these 13 sections:
+
+      | Section | Purpose |
+      |---------|---------|
+      | Purpose | What this milestone achieves; governance rationale |
+      | Scope | What is in/out of scope; affected repos/systems |
+      | Governance Artifacts | Policy issues, decision records, approval artifacts |
+      | Canonical Policies | Formal policy statements this milestone enacts |
+      | Amendment History | Changes to milestone scope/description since creation |
+      | Architecture Decisions | Key architectural decisions made within this milestone |
+      | Implementation Issues | Gitea issues implementing the defined policies |
+      | Dependency Ordering | Which issues must complete before others |
+      | Acceptance Criteria | What "done" looks like for this milestone |
+      | Rollback / Containment | How to reverse milestone changes if needed |
+      | Operational Status | Current execution state (planning/active/blocked/complete) |
+      | Audit / Validation Artifacts | Evidence artifacts, scan results, approval records |
+      | Open Questions | Outstanding decisions that block or affect completion |
+
+      ## Analysis Tasks
+
+      Perform all five analysis tasks. Be specific — quote exact text from the source data.
+
+      ### Task 1: Map Existing Content
+
+      For each bullet in the current milestone description:
+      - What governance concept does it represent?
+      - Which canonical section does it belong to?
+      - What operator intent must be preserved?
+
+      ### Task 2: Gap Detection
+
+      For each of the 13 required sections, classify as:
+      - **PRESENT**: Section exists with adequate content
+      - **PARTIAL**: Content maps to this section but lacks structure
+      - **INFERRED**: Content can be derived from attached issues or org context
+      - **MISSING**: No content available for this section
+
+      ### Task 3: Issue Analysis
+
+      For each attached issue:
+      - What governance role does it play within this milestone?
+      - Is it correctly labelled? List any missing canonical labels.
+      - Which governance sections does its content cover?
+      - Are there any governance artifacts referenced in the issue body?
+
+      ### Task 4: Cross-Reference Scan
+
+      Scan ALL open issues across the repo:
+      - Which issues logically relate to this milestone but are not attached?
+      - Which issues contain governance concepts directly relevant to this milestone?
+      - Note: Do NOT recommend attaching issues without evidence of relevance.
+
+      ### Task 5: Provenance Registry
+
+      List everything that must be preserved exactly as-is:
+      - Every bullet point from the original milestone description (verbatim)
+      - All issue numbers and titles
+      - All issue body content
+      - All existing labels and milestone assignments
+
+      ## Output
+
+      Write a structured analysis document in markdown. Do NOT propose normalized
+      content yet — only diagnose gaps with specific, evidenced findings.
+    depends_on: [fetch-milestone, fetch-org-context]
+    context: fresh
+    denied_tools: [Write, Edit, Bash]
+    hooks:
+      PostToolUse:
+        - matcher: "Read"
+          response:
+            hookSpecificOutput:
+              hookEventName: PostToolUse
+              additionalContext: >
+                Note any governance-relevant content you found. Ask: does this content
+                map to one of the 13 required sections? Could it be used to fill a
+                MISSING section? Note it in your running analysis.
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 3: NORMALIZE
+  # Generate governed milestone description + dry-run summary
+  # Writes preview to artifact — never touches live Gitea data
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: normalize
+    prompt: |
+      You are a governance normalization agent. Generate a complete normalized
+      milestone description and a dry-run change summary.
+
+      ## Gap Analysis
+
+      $analyze.output
+
+      ## Original Milestone Data
+
+      $fetch-milestone.output
+
+      ## Org Context (for label and issue verification)
+
+      $fetch-org-context.output
+
+      ## Normalization Rules — FOLLOW EXACTLY
+
+      1. **Preserve all operator content** — every bullet from the original description
+         must appear in the normalized version, placed in the appropriate section
+      2. **Never fabricate issue references** — only reference issue numbers that appear
+         in the Gitea data above; never invent issue numbers
+      3. **Never create issues** — only reference existing issues by their actual numbers
+      4. **Use canonical labels only** — only reference labels visible in the org context
+      5. **Mark gaps explicitly** — use `> ⚠️ PENDING: [description]` for empty sections
+      6. **Preserve governance provenance** — Amendment History entry for this normalization
+      7. **Stay within 4000 characters** — Gitea milestone description limit
+      8. **Sections in canonical order** — follow the 13-section sequence exactly
+
+      ## Output Format
+
+      Generate TWO distinct blocks:
+
+      ### Block 1: Normalized Milestone Description
+      Complete markdown for the milestone description field.
+      Start with `<!-- NORMALIZED DESCRIPTION START -->` and end with
+      `<!-- NORMALIZED DESCRIPTION END -->`.
+
+      Sections (in order):
+      1. ## Purpose
+      2. ## Scope
+      3. ## Governance Artifacts
+      4. ## Canonical Policies
+      5. ## Amendment History
+      6. ## Architecture Decisions
+      7. ## Implementation Issues
+      8. ## Dependency Ordering
+      9. ## Acceptance Criteria
+      10. ## Rollback / Containment
+      11. ## Operational Status
+      12. ## Audit / Validation Artifacts
+      13. ## Open Questions
+
+      ### Block 2: Dry-Run Change Summary
+      Start with `<!-- DRY-RUN SUMMARY START -->` and end with
+      `<!-- DRY-RUN SUMMARY END -->`.
+
+      Include:
+      - **Preserved from original**: each bullet verbatim from original description
+      - **Sections added**: each new section and what filled it
+      - **Sections with PENDING gaps**: sections that couldn't be filled
+      - **Issue references included**: issue number, title, role
+      - **Issues NOT attached to milestone** (if any should be): with justification
+      - **Label corrections needed**: `Issue #N: add label X (reason)`
+      - **What this normalization does NOT do** (invariant list)
+
+      After writing your response, save the complete output to:
+      $ARTIFACTS_DIR/normalization-preview.md
+
+      Use the Write tool to create this file with your full output.
+    depends_on: [analyze]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 4: HIL APPROVAL GATE
+  # Present dry-run to operator — loop until explicit decision
+  # NEVER proceeds automatically — fabricated approval is prohibited
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: hil-gate
+    loop:
+      prompt: |
+        # Milestone Governance Normalizer — Operator Review
+
+        You are presenting a governance normalization dry-run to the operator
+        and awaiting their explicit approval before any mutation occurs.
+
+        ## Normalization Preview
+
+        $normalize.output
+
+        ## Operator's Latest Input
+
+        $LOOP_USER_INPUT
+
+        ---
+
+        ## FIRST ITERATION (no operator input yet)
+
+        Read the file at $ARTIFACTS_DIR/normalization-preview.md for the full
+        normalization content. Present it clearly to the operator:
+
+        1. Display the full normalized milestone description (in a fenced code block)
+        2. Display the complete dry-run change summary
+        3. Show this approval prompt:
+
+        ```
+        ════════════════════════════════════════════════════════════════
+        GOVERNANCE NORMALIZATION DRY-RUN — AWAITING OPERATOR DECISION
+        ════════════════════════════════════════════════════════════════
+
+        Target:  Privileged Execution & Governed Escalation Layer
+        Action:  Update milestone description with governed structure
+        Effect:  Milestone description will be overwritten with the preview above
+
+        To proceed:
+          APPROVE  — apply the normalization to the live milestone
+          REJECT   — abort with no changes made
+          Or describe any modifications you want before approval
+
+        No changes will be made until you type APPROVE.
+        ════════════════════════════════════════════════════════════════
+        ```
+
+        DO NOT emit any decision signal. Wait for the operator.
+
+        ---
+
+        ## SUBSEQUENT ITERATIONS (operator has responded)
+
+        **If operator typed APPROVE (or: yes, apply, approved, go ahead, confirm):**
+        - Echo back what will be applied in 2-3 sentences
+        - Write the string "APPROVED" (exactly, no other content) to:
+          $ARTIFACTS_DIR/hil-decision.txt
+        - Emit: <promise>NORMALIZATION_DECISION_MADE</promise>
+
+        **If operator typed REJECT (or: no, abort, cancel, stop, reject):**
+        - Acknowledge clearly: "Normalization aborted. No changes were made."
+        - Write the string "REJECTED" (exactly) to:
+          $ARTIFACTS_DIR/hil-decision.txt
+        - Emit: <promise>NORMALIZATION_DECISION_MADE</promise>
+
+        **If operator requested modifications:**
+        - Acknowledge each requested change specifically
+        - Ask: "Should I incorporate these changes and re-run normalization,
+          or would you like to approve the current version as-is?"
+        - Do NOT emit any signal — wait for their response
+
+        **CRITICAL SAFETY RULES:**
+        - NEVER emit NORMALIZATION_DECISION_MADE without a clear operator decision
+        - NEVER write "APPROVED" to the artifact without an explicit approval
+        - NEVER apply any changes yourself — only write to the decision artifact
+        - NEVER fabricate operator approval under any circumstances
+      until: NORMALIZATION_DECISION_MADE
+      max_iterations: 8
+      interactive: true
+      gate_message: |
+        Review the normalization preview above.
+        Type **APPROVE** to apply changes to the live milestone,
+        **REJECT** to abort without changes,
+        or describe modifications needed.
+    depends_on: [normalize]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 5: READ DECISION
+  # Deterministic bash check — decision from artifact, not AI inference
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: check-decision
+    bash: |
+      DECISION_FILE="$ARTIFACTS_DIR/hil-decision.txt"
+      if [ -f "$DECISION_FILE" ]; then
+        DECISION=$(cat "$DECISION_FILE" | tr -d '[:space:]')
+        echo "$DECISION"
+      else
+        # No decision file — treat as rejected (fail closed)
+        echo "REJECTED"
+      fi
+    depends_on: [hil-gate]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 6A-1: PREPARE APPROVED PATCH
+  # Prompt node — reads artifacts, extracts and validates normalized
+  # description, writes approved-patch.json for the bash apply node.
+  # No Bash execution allowed — Write restricted to patch artifact only.
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: prepare-approved-patch
+    prompt: |
+      Prepare the approved patch payload for milestone update.
+
+      ## Approved Decision
+
+      $check-decision.output
+
+      ## Instructions
+
+      1. Read the full normalization preview:
+         $ARTIFACTS_DIR/normalization-preview.md
+
+      2. Extract the normalized description — the text between
+         `<!-- NORMALIZED DESCRIPTION START -->` and `<!-- NORMALIZED DESCRIPTION END -->`.
+         Strip the marker comment lines themselves; keep only the inner content.
+
+      3. Validate the extracted description:
+         - Confirm it contains all 13 expected section headers:
+           `## Purpose`, `## Scope`, `## Governance Artifacts`,
+           `## Canonical Policies`, `## Amendment History`,
+           `## Architecture Decisions`, `## Implementation Issues`,
+           `## Dependency Ordering`, `## Acceptance Criteria`,
+           `## Rollback / Containment`, `## Operational Status`,
+           `## Audit / Validation Artifacts`, `## Open Questions`
+         - Confirm character count is within 4000 characters
+         - If any check fails, halt and report the validation failure.
+           Do NOT write the patch file.
+
+      4. If validation passes, write the patch payload to:
+         $ARTIFACTS_DIR/approved-patch.json
+
+         The file must be valid JSON in exactly this shape:
+         {"description": "<escaped description content>"}
+
+         Use the Write tool to create this file. This is the only file
+         write permitted in this node.
+
+      5. Report to the operator:
+         - How many section headers were confirmed present
+         - Character count of the extracted description
+         - Confirmation that $ARTIFACTS_DIR/approved-patch.json was written
+         - The first 150 characters of the description as a sanity preview
+
+      ## On Validation Failure
+
+      List which section headers were missing or which limit was exceeded.
+      Do NOT write the patch file.
+      The apply node will fail safely because the patch file will not exist.
+    depends_on: [check-decision]
+    when: "$check-decision.output == 'APPROVED'"
+    denied_tools: [Bash, Edit]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 6A-2: APPLY APPROVED PATCH
+  # Bash node — single deterministic PATCH using normal repo token.
+  # Reads pre-validated payload written by prepare-approved-patch.
+  # Verifies the live milestone body contains expected section markers.
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: apply-approved-patch
+    bash: |
+      set -euo pipefail
+
+      REPO="FaithJourney/system-governance"
+      BASE_URL="http://192.168.1.50:3000/api/v1"
+      PATCH_FILE="$ARTIFACTS_DIR/approved-patch.json"
+      ID_FILE="$ARTIFACTS_DIR/.milestone-id"
+      PATCH_RESP="$ARTIFACTS_DIR/patch-response.json"
+      RESULT_FILE="$ARTIFACTS_DIR/apply-result.md"
+
+      # ── GUARD: patch file must exist ──────────────────────────────
+      if [ ! -f "$PATCH_FILE" ]; then
+        echo "ERROR: $PATCH_FILE not found — prepare-approved-patch validation may have failed" >&2
+        exit 1
+      fi
+
+      # ── GUARD: milestone ID must be known ─────────────────────────
+      if [ ! -f "$ID_FILE" ]; then
+        echo "ERROR: $ID_FILE not found — fetch-milestone did not complete" >&2
+        exit 1
+      fi
+
+      # ── GUARD: validate JSON structure before sending ─────────────
+      python3 -c "
+import json, sys
+with open('$PATCH_FILE') as f:
+    try:
+        data = json.load(f)
+    except json.JSONDecodeError as e:
+        print(f'ERROR: approved-patch.json is not valid JSON: {e}', file=sys.stderr)
+        sys.exit(1)
+if 'description' not in data:
+    print('ERROR: approved-patch.json missing required \"description\" key', file=sys.stderr)
+    sys.exit(1)
+desc = data['description']
+if not isinstance(desc, str) or len(desc.strip()) == 0:
+    print('ERROR: description value is empty or not a string', file=sys.stderr)
+    sys.exit(1)
+print(f'JSON valid  : description length = {len(desc)} chars')
+" || exit 1
+
+      MILESTONE_ID=$(cat "$ID_FILE" | tr -d '[:space:]')
+      PAYLOAD_BYTES=$(wc -c < "$PATCH_FILE")
+
+      echo "=== APPLYING PATCH ==="
+      echo "Milestone ID : $MILESTONE_ID"
+      echo "Token        : GITEA_TOKEN (repo-scoped)"
+      echo "Payload file : $PATCH_FILE"
+      echo "Payload size : $PAYLOAD_BYTES bytes"
+      echo ""
+
+      # ── SINGLE DETERMINISTIC PATCH ────────────────────────────────
+      # Capture HTTP status separately from body — no retry, no fallback
+      HTTP_STATUS=$(curl -s \
+        -o "$PATCH_RESP" \
+        -w "%{http_code}" \
+        -X PATCH \
+        "$BASE_URL/repos/$REPO/milestones/$MILESTONE_ID" \
+        -H "Authorization: token $GITEA_TOKEN" \
+        -H "Content-Type: application/json" \
+        --data-binary "@$PATCH_FILE")
+
+      echo "=== PATCH RESPONSE (HTTP $HTTP_STATUS) ==="
+      python3 -m json.tool "$PATCH_RESP" 2>/dev/null || cat "$PATCH_RESP"
+      echo ""
+
+      # Fail immediately on non-2xx — write minimal result artifact before exit
+      if [ "$HTTP_STATUS" -lt 200 ] || [ "$HTTP_STATUS" -ge 300 ]; then
+        cat > "$RESULT_FILE" <<EOF
+# Apply Result — FAILED
+
+- **Milestone ID:** $MILESTONE_ID
+- **PATCH HTTP status:** $HTTP_STATUS
+- **Verification:** NOT REACHED — PATCH request failed
+- **Outcome:** FAIL
+EOF
+        echo "ERROR: PATCH returned HTTP $HTTP_STATUS — no verification attempted" >&2
+        exit 1
+      fi
+
+      # ── VERIFICATION ──────────────────────────────────────────────
+      echo "=== VERIFICATION ==="
+      LIVE=$(curl -sf \
+        "$BASE_URL/repos/$REPO/milestones/$MILESTONE_ID" \
+        -H "Authorization: token $GITEA_TOKEN")
+
+      LIVE_DESC=$(echo "$LIVE" | python3 -c "import json,sys; print(json.load(sys.stdin)['description'])")
+      LIVE_CHARS=$(echo "$LIVE_DESC" | python3 -c "import sys; print(len(sys.stdin.read()))")
+      LIVE_UPDATED=$(echo "$LIVE" | python3 -c "import json,sys; print(json.load(sys.stdin)['updated_at'])")
+
+      echo "Updated at   : $LIVE_UPDATED"
+      echo "Desc length  : $LIVE_CHARS chars"
+      echo ""
+
+      SECTIONS=(
+        "## Purpose"
+        "## Scope"
+        "## Governance Artifacts"
+        "## Canonical Policies"
+        "## Amendment History"
+        "## Architecture Decisions"
+        "## Implementation Issues"
+        "## Dependency Ordering"
+        "## Acceptance Criteria"
+        "## Rollback / Containment"
+        "## Operational Status"
+        "## Audit / Validation Artifacts"
+        "## Open Questions"
+      )
+
+      ALL_PASS=true
+      PASS_COUNT=0
+      FAILED_SECTIONS=()
+
+      for SECTION in "${SECTIONS[@]}"; do
+        if echo "$LIVE_DESC" | grep -qF "$SECTION"; then
+          echo "  [PASS] $SECTION"
+          PASS_COUNT=$((PASS_COUNT + 1))
+        else
+          echo "  [FAIL] $SECTION — NOT FOUND in live milestone"
+          ALL_PASS=false
+          FAILED_SECTIONS+=("$SECTION")
+        fi
+      done
+
+      TOTAL=${#SECTIONS[@]}
+      echo ""
+
+      # ── WRITE apply-result.md UNCONDITIONALLY ─────────────────────
+      {
+        if [ "$ALL_PASS" = "true" ]; then
+          echo "# Apply Result — PASS"
+        else
+          echo "# Apply Result — FAIL (verification)"
+        fi
+        echo ""
+        echo "- **Milestone ID:** $MILESTONE_ID"
+        echo "- **PATCH HTTP status:** $HTTP_STATUS"
+        echo "- **Updated at:** $LIVE_UPDATED"
+        echo "- **Description length:** $LIVE_CHARS chars"
+        echo "- **Sections verified:** $PASS_COUNT / $TOTAL"
+        echo "- **Outcome:** $([ "$ALL_PASS" = "true" ] && echo "PASS" || echo "FAIL")"
+        echo "- **URL:** http://192.168.1.50:3000/FaithJourney/system-governance/milestone/$MILESTONE_ID"
+        echo ""
+        echo "## Section Verification"
+        echo ""
+        for SECTION in "${SECTIONS[@]}"; do
+          if echo "$LIVE_DESC" | grep -qF "$SECTION"; then
+            echo "- [x] $SECTION"
+          else
+            echo "- [ ] $SECTION — MISSING"
+          fi
+        done
+        if [ "${#FAILED_SECTIONS[@]}" -gt 0 ]; then
+          echo ""
+          echo "## Failed Sections"
+          echo ""
+          for S in "${FAILED_SECTIONS[@]}"; do
+            echo "- $S"
+          done
+        fi
+      } > "$RESULT_FILE"
+
+      # ── FINAL OUTCOME ─────────────────────────────────────────────
+      if [ "$ALL_PASS" = "true" ]; then
+        echo "VERIFICATION: PASS — all $TOTAL sections confirmed in live milestone"
+        echo "Milestone URL: http://192.168.1.50:3000/FaithJourney/system-governance/milestone/$MILESTONE_ID"
+      else
+        echo "VERIFICATION: FAIL — $((TOTAL - PASS_COUNT)) section(s) missing from live milestone" >&2
+        echo "PATCH was applied (HTTP $HTTP_STATUS) but content verification failed." >&2
+        echo "Failed sections written to $RESULT_FILE" >&2
+        exit 1
+      fi
+    depends_on: [prepare-approved-patch]
+    when: "$check-decision.output == 'APPROVED'"
+    timeout: 30000
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 6B: REPORT REJECTED
+  # Operator declined — preserve artifacts, no mutation
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: report-rejected
+    prompt: |
+      The normalization was rejected or no decision was recorded.
+
+      ## Decision
+
+      $check-decision.output
+
+      Report to the operator:
+
+      1. Confirm: No changes were made to any live Gitea data.
+
+      2. Inform them that the dry-run artifacts are preserved at:
+         - $ARTIFACTS_DIR/normalization-preview.md (full normalized description + dry-run summary)
+
+      3. Provide options for next steps:
+         - Re-run with modifications: invoke archon-milestone-governance-normalizer again
+           with specific instructions for what to change
+         - Apply manually: the normalized description in the artifacts file can be
+           copy-pasted into the Gitea milestone description field directly
+
+      4. If the decision was REJECTED (explicit), acknowledge their choice.
+         If no decision file was found (workflow anomaly), note that and
+         suggest re-running.
+    depends_on: [check-decision]
+    when: "$check-decision.output != 'APPROVED'"
+    context: fresh
